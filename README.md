@@ -1,5 +1,7 @@
 # SSH Remote
 
+Repositório: https://github.com/michelbsbfranca/ssh-remote
+
 Cliente SSH desktop, semelhante ao PuTTY, com gerenciador de sessões salvas
 (usuário e senha pré-definidos por sessão) e terminal em abas.
 
