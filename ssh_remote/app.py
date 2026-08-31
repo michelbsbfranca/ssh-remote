@@ -1,13 +1,14 @@
 """Aplicação principal: SSH Remote - gerenciador de sessões com terminal em abas."""
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import tkinter as tk
 from tkinter import filedialog
 
 import ttkbootstrap as ttk
 
-from . import dialogs, preferences
+from . import dialogs, network, preferences
 from .category_manager import Category, CategoryManager
 from .session_manager import Session, SessionManager
 from .terminal import SSHTerminalFrame
@@ -16,6 +17,29 @@ THEME_DARK = "darkly"
 THEME_LIGHT = "flatly"
 
 NONE_CATEGORY_IID = "cat:none"
+
+PING_INTERVAL_MS = 30_000
+STATUS_COLORS = {
+    "online": "#2fb344",
+    "offline": "#e6423d",
+    "unknown": "#9aa0a6",
+}
+
+
+def _make_dot_icon(color: str, size: int = 10) -> tk.PhotoImage:
+    """Gera um pequeno ícone circular colorido (bolinha de status) em runtime,
+    sem depender de fonte de emoji instalada no sistema."""
+    img = tk.PhotoImage(width=size, height=size)
+    radius = size / 2
+    center = (size - 1) / 2
+    for y in range(size):
+        for x in range(size):
+            dx, dy = x - center, y - center
+            if dx * dx + dy * dy <= radius * radius:
+                img.put(color, (x, y))
+            else:
+                img.transparency_set(x, y, True)
+    return img
 
 
 def _cat_iid(category_id: str) -> str:
@@ -198,11 +222,18 @@ class MainWindow(ttk.Window):
         self.manager = SessionManager()
         self.category_manager = CategoryManager()
 
+        self._status_icons = {status: _make_dot_icon(color) for status, color in STATUS_COLORS.items()}
+        self._session_status: dict[str, str] = {}
+        self._ping_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self._ping_after_id: str | None = None
+        self._closing = False
+
         # tab_id (str) -> SSHTerminalFrame
         self._open_terminals: dict[str, SSHTerminalFrame] = {}
 
         self._build_ui()
         self._refresh_tree()
+        self._start_ping_cycle()
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
 
     # ---------- construção da UI ----------
@@ -228,6 +259,8 @@ class MainWindow(ttk.Window):
         # ----- coluna esquerda: sessões e categorias -----
         left = ttk.Frame(paned, padding=(4, 0, 8, 0))
         paned.add(left, weight=0)
+
+        self._build_dashboard(left)
 
         ttk.Label(left, text="SESSÕES", font=("Segoe UI", 9, "bold"), bootstyle="secondary").pack(
             anchor="w", pady=(0, 6)
@@ -315,6 +348,37 @@ class MainWindow(ttk.Window):
 
         self.bind("<Control-w>", lambda _e: self._close_current_tab())
 
+    def _build_dashboard(self, parent) -> None:
+        dash = ttk.Frame(parent, padding=(10, 8), bootstyle="secondary")
+        dash.pack(fill="x", pady=(0, 10))
+
+        self._dash_total_var = tk.StringVar(value="0 hosts")
+        self._dash_online_var = tk.StringVar(value="0")
+        self._dash_offline_var = tk.StringVar(value="0")
+
+        ttk.Label(
+            dash, textvariable=self._dash_total_var, font=("Segoe UI", 9, "bold"),
+            bootstyle="inverse-secondary",
+        ).pack(side="left")
+
+        ttk.Label(
+            dash, image=self._status_icons["online"], textvariable=self._dash_online_var,
+            compound="left", font=("Segoe UI", 9), bootstyle="inverse-secondary",
+        ).pack(side="right", padx=(10, 0))
+        ttk.Label(
+            dash, image=self._status_icons["offline"], textvariable=self._dash_offline_var,
+            compound="left", font=("Segoe UI", 9), bootstyle="inverse-secondary",
+        ).pack(side="right")
+
+    def _update_dashboard(self) -> None:
+        sessions = self.manager.sessions
+        total = len(sessions)
+        online = sum(1 for s in sessions if self._session_status.get(s.id) == "online")
+        offline = sum(1 for s in sessions if self._session_status.get(s.id) == "offline")
+        self._dash_total_var.set(f"{total} host{'s' if total != 1 else ''}")
+        self._dash_online_var.set(str(online))
+        self._dash_offline_var.set(str(offline))
+
     def _configure_tree_tags(self) -> None:
         colors = self.style.colors
         self.tree.tag_configure("category", font=("Segoe UI", 10, "bold"))
@@ -351,20 +415,50 @@ class MainWindow(ttk.Window):
             iid = _cat_iid(cat.id)
             self.tree.insert(
                 "", "end", iid=iid, text=f"📁  {cat.name}",
-                open=open_states.get(iid, True), tags=("category",),
+                open=open_states.get(iid, False), tags=("category",),
             )
         self.tree.insert(
             "", "end", iid=NONE_CATEGORY_IID, text="📁  Sem categoria",
-            open=open_states.get(NONE_CATEGORY_IID, True), tags=("category",),
+            open=open_states.get(NONE_CATEGORY_IID, False), tags=("category",),
         )
 
         valid_cat_ids = {c.id for c in categories}
         for s in self.manager.list_sorted():
             parent = _cat_iid(s.category_id) if s.category_id in valid_cat_ids else NONE_CATEGORY_IID
-            self.tree.insert(parent, "end", iid=_sess_iid(s.id), text=s.name, tags=("session",))
+            icon = self._status_icons[self._session_status.get(s.id, "unknown")]
+            self.tree.insert(
+                parent, "end", iid=_sess_iid(s.id), text=s.name, image=icon, tags=("session",),
+            )
 
         if selected_iid and self.tree.exists(selected_iid):
             self.tree.selection_set(selected_iid)
+
+        self._update_dashboard()
+
+    # ---------- status online/offline (checagem TCP na porta SSH) ----------
+    def _start_ping_cycle(self) -> None:
+        if self._closing:
+            return
+        for s in self.manager.sessions:
+            self._queue_ping(s.id, s.host, s.port)
+        self._ping_after_id = self.after(PING_INTERVAL_MS, self._start_ping_cycle)
+
+    def _queue_ping(self, session_id: str, host: str, port: int) -> None:
+        self._ping_executor.submit(self._ping_worker, session_id, host, port)
+
+    def _ping_worker(self, session_id: str, host: str, port: int) -> None:
+        online = network.is_host_online(host, port or 22)
+        self.after(0, self._apply_ping_result, session_id, online)
+
+    def _apply_ping_result(self, session_id: str, online: bool) -> None:
+        if self._closing:
+            return
+        status = "online" if online else "offline"
+        self._session_status[session_id] = status
+        iid = _sess_iid(session_id)
+        if self.tree.exists(iid):
+            self.tree.item(iid, image=self._status_icons[status])
+        self._update_dashboard()
 
     def _selected_session(self) -> Session | None:
         sel = self.tree.selection()
@@ -388,6 +482,7 @@ class MainWindow(ttk.Window):
         if dialog.result:
             self.manager.add(dialog.result)
             self._refresh_tree()
+            self._queue_ping(dialog.result.id, dialog.result.host, dialog.result.port)
 
     def _edit_session(self) -> None:
         session = self._selected_session()
@@ -399,6 +494,7 @@ class MainWindow(ttk.Window):
         if dialog.result:
             self.manager.update(dialog.result)
             self._refresh_tree()
+            self._queue_ping(dialog.result.id, dialog.result.host, dialog.result.port)
 
     def _duplicate_session(self) -> None:
         session = self._selected_session()
@@ -410,6 +506,7 @@ class MainWindow(ttk.Window):
         clone.name = f"{session.name} (cópia)"
         self.manager.add(clone)
         self._refresh_tree()
+        self._queue_ping(clone.id, clone.host, clone.port)
 
     def _delete_session(self) -> None:
         session = self._selected_session()
@@ -695,6 +792,10 @@ class MainWindow(ttk.Window):
             self._show_placeholder()
 
     def _on_app_close(self) -> None:
+        self._closing = True
+        if self._ping_after_id is not None:
+            self.after_cancel(self._ping_after_id)
+        self._ping_executor.shutdown(wait=False)
         for terminal in list(self._open_terminals.values()):
             terminal.close()
         self.destroy()
