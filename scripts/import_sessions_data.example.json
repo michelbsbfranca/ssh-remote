@@ -1,0 +1,8 @@
+{
+  "username": "user",
+  "password": "changeme",
+  "port": 22,
+  "entries": [
+    ["nome-da-sessao", "10.0.0.1"]
+  ]
+}

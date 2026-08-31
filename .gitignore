@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# ambiente virtual
+.venv/
+venv/
+env/
+
+# dados sensíveis (credenciais/IPs reais) - use o .example.json como modelo
+scripts/import_sessions_data.json
+
+# editores / IDEs
+.vscode/
+.idea/
+*.swp
+
+# arquivos de SO
+.DS_Store
+Thumbs.db
