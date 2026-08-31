@@ -13,6 +13,14 @@ from .session_manager import Session
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 
+# Alguns dispositivos (ex.: switches HP/H3C Comware) não ecoam BS/DEL puro
+# para apagar — em vez disso mandam "mover cursor p/ esquerda N, N espaços,
+# mover cursor p/ esquerda N de novo" (ex.: "\x1b[1D \x1b[1D") para desenhar
+# o apagamento. Isso precisa virar N backspaces *antes* do ANSI_ESCAPE_RE
+# rodar, senão os códigos de cursor são descartados e sobra só o espaço solto
+# na tela.
+CURSOR_BACK_ERASE_RE = re.compile(r"\x1b\[\d+D( +)\x1b\[\d+D")
+
 # Cores fixas do terminal — não seguem o tema claro/escuro da interface,
 # igual a um emulador de terminal de verdade (ttkbootstrap reaplica as cores
 # do tema em widgets tk.Text ao trocar de tema, por isso precisam ser
@@ -24,7 +32,10 @@ TERMINAL_CURSOR = "white"
 # Teclas especiais -> sequência enviada ao servidor
 SPECIAL_KEYS = {
     "Return": "\r",
-    "BackSpace": "\x7f",
+    # Alguns servidores só reconhecem BS (\x08, o mesmo byte que Ctrl+H
+    # produz) para apagar, em vez do DEL (\x7f) padrão — mapear a tecla
+    # Backspace para \x08 evita que o usuário precise usar Ctrl+H manualmente.
+    "BackSpace": "\x08",
     "Tab": "\t",
     "Escape": "\x1b",
     "Up": "\x1b[A",
@@ -115,6 +126,7 @@ class SSHTerminalFrame(ttk.Frame):
                 if not data:
                     break
                 text = data.decode("utf-8", errors="ignore")
+                text = CURSOR_BACK_ERASE_RE.sub(lambda m: "\x08" * len(m.group(1)), text)
                 text = ANSI_ESCAPE_RE.sub("", text)
                 self._append(text)
         except (OSError, EOFError):
@@ -169,7 +181,22 @@ class SSHTerminalFrame(ttk.Frame):
     # ---------- saída ----------
     def _append(self, text: str) -> None:
         def do_append():
-            self.text.insert("end", text)
+            # BS (\x08) e DEL (\x7f) chegam como texto puro depois do strip de
+            # ANSI, ecoados pelo servidor para apagar o caractere anterior (ex.:
+            # a sequência clássica "\b \b"). Inserir esse byte de controle
+            # literalmente no Text mostra um glifo/caixa em vez de apagar, então
+            # tratamos como "apagar o último caractere exibido".
+            for ch in text:
+                if ch in ("\x08", "\x7f"):
+                    self.text.delete("end-2c", "end-1c")
+                elif ch in ("\r", "\x07"):
+                    # \r puro (parte de "\r\n") e BEL (\x07, beep de alguns
+                    # dispositivos ao apagar além do início da linha) também
+                    # apareciam como glifo literal — nenhum dos dois deve ser
+                    # exibido.
+                    continue
+                else:
+                    self.text.insert("end", ch)
             self.text.see("end")
 
         self.after(0, do_append)
